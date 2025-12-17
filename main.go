@@ -2,131 +2,42 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-type LogLevel int
-
-const (
-	DEBUG LogLevel = iota
-	INFO
-	WARN
-	ERROR
+var (
+	requestCount uint64
 )
 
-type Logger struct {
-	level LogLevel
-	l     *log.Logger
-}
-
-func NewLogger(level LogLevel) *Logger {
-	return &Logger{
-		level: level,
-		l:     log.New(os.Stdout, "", 0),
-	}
-}
-
-func (lg *Logger) log(level LogLevel, msg string, fields map[string]any) {
-	if level < lg.level {
-		return
-	}
-
-	entry := map[string]any{
-		"ts":    time.Now().UTC().Format(time.RFC3339Nano),
-		"level": level.String(),
-		"msg":   msg,
-	}
-
-	for k, v := range fields {
-		entry[k] = v
-	}
-
-	b, _ := json.Marshal(entry)
-	lg.l.Println(string(b))
-}
-
-func (lg *Logger) Debug(msg string, f map[string]any) { lg.log(DEBUG, msg, f) }
-func (lg *Logger) Info(msg string, f map[string]any)  { lg.log(INFO, msg, f) }
-func (lg *Logger) Warn(msg string, f map[string]any)  { lg.log(WARN, msg, f) }
-func (lg *Logger) Error(msg string, f map[string]any) { lg.log(ERROR, msg, f) }
-
-func (l LogLevel) String() string {
-	switch l {
-	case DEBUG:
-		return "debug"
-	case INFO:
-		return "info"
-	case WARN:
-		return "warn"
-	case ERROR:
-		return "error"
-	default:
-		return "unknown"
-	}
-}
-
-func parseLogLevel(v string) LogLevel {
-	switch v {
-	case "debug":
-		return DEBUG
-	case "warn":
-		return WARN
-	case "error":
-		return ERROR
-	default:
-		return INFO
-	}
-}
-
-type statusRecorder struct {
-	http.ResponseWriter
-	status int
-}
-
-func (r *statusRecorder) WriteHeader(code int) {
-	r.status = code
-	r.ResponseWriter.WriteHeader(code)
-}
-
-var reqCounter uint64
-
-func requestID() string {
-	id := atomic.AddUint64(&reqCounter, 1)
-	return strconv.FormatUint(id, 10) + "-" + strconv.FormatInt(rand.Int63(), 36)
-}
-
 func main() {
-	rand.Seed(time.Now().UnixNano())
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.LUTC)
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
+	logger.Println("service starting")
 
-	level := parseLogLevel(os.Getenv("LOG_LEVEL"))
-	logger := NewLogger(level)
-
-	startupDelay, _ := time.ParseDuration(os.Getenv("STARTUP_DELAY"))
-	if startupDelay > 0 {
-		logger.Info("startup delay", map[string]any{
-			"delay": startupDelay.String(),
-		})
-		time.Sleep(startupDelay)
-	}
+	// Periodic background logs
+	go heartbeat(logger, 5*time.Second)
+	go backgroundWorker(logger, 7*time.Second)
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("hello from containerized go service\n"))
+		atomic.AddUint64(&requestCount, 1)
+
+		logger.Printf(
+			"request received method=%s path=%s remote=%s",
+			r.Method,
+			r.URL.Path,
+			r.RemoteAddr,
+		)
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("hello\n"))
 	})
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -134,69 +45,59 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	handler := withMiddleware(mux, logger)
-
 	server := &http.Server{
-		Addr:    ":" + port,
-		Handler: handler,
+		Addr:    ":8080",
+		Handler: mux,
 	}
 
 	go func() {
-		logger.Info("http server starting", map[string]any{
-			"port": port,
-		})
-
+		logger.Println("http server listening on :8080")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("http server error", map[string]any{
-				"error": err.Error(),
-			})
+			logger.Printf("server error: %v", err)
 			os.Exit(1)
 		}
 	}()
 
+	// Wait for shutdown signal
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	<-sig
-	logger.Warn("shutdown signal received", nil)
+	logger.Println("shutdown signal received")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		logger.Error("graceful shutdown failed", map[string]any{
-			"error": err.Error(),
-		})
+		logger.Printf("graceful shutdown failed: %v", err)
 	} else {
-		logger.Info("server stopped", nil)
+		logger.Println("server stopped cleanly")
 	}
 }
 
-func withMiddleware(next http.Handler, logger *Logger) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		rec := &statusRecorder{ResponseWriter: w, status: 200}
+func heartbeat(logger *log.Logger, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-		rid := r.Header.Get("X-Request-Id")
-		if rid == "" {
-			rid = requestID()
-		}
-		w.Header().Set("X-Request-Id", rid)
+	for t := range ticker.C {
+		logger.Printf(
+			"heartbeat alive=true uptime=%s requests=%d",
+			time.Since(t.Add(-interval)).Truncate(time.Second),
+			atomic.LoadUint64(&requestCount),
+		)
+	}
+}
 
-		logger.Debug("request started", map[string]any{
-			"request_id": rid,
-			"method":     r.Method,
-			"path":       r.URL.Path,
-		})
+func backgroundWorker(logger *log.Logger, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-		next.ServeHTTP(rec, r)
+	for range ticker.C {
+		logger.Println("background job started")
 
-		logger.Info("request completed", map[string]any{
-			"request_id": rid,
-			"method":     r.Method,
-			"path":       r.URL.Path,
-			"status":     rec.status,
-			"duration":   time.Since(start).Milliseconds(),
-		})
-	})
+		// Simulated work
+		time.Sleep(500 * time.Millisecond)
+
+		logger.Println("background job completed")
+	}
 }
