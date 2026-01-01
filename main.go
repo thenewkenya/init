@@ -46,12 +46,12 @@ func main() {
 	})
 
 	server := &http.Server{
-		Addr:    ":8090",
+		Addr:    ":8080",
 		Handler: mux,
 	}
 
 	go func() {
-		logger.Println("http server listening on :8090")
+		logger.Println("http server listening on :8080")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Printf("server error: %v", err)
 			os.Exit(1)
